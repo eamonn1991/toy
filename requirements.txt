@@ -1,0 +1,22 @@
+# Database
+SQLAlchemy==2.0.27
+psycopg2-binary==2.9.9 
+sqlalchemy-utils==0.41.1
+
+# Configuration
+pydantic>=2.0.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# HTTP and API
+requests==2.31.0
+
+# Date/Time handling
+pytz==2024.1
+
+# Development and testing
+black>=24.1.0  # Code formatting
+flake8>=7.0.0  # Linting
+pytest>=8.0.0  # Testing
+python-dateutil==2.8.2
+argparse==1.4.0 
