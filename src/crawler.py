@@ -623,26 +623,67 @@ def main():
     parser.add_argument('--total-num-repo', type=int, help='Override total number of repositories to fetch')
     parser.add_argument('--num-threads', type=int, default=settings.default_number_threads,
                       help='Number of threads to use for crawling (default: 4)')
+    parser.add_argument('--repeat-count', type=int, help='Number of times to repeat the single fetch operation')
 
     args = parser.parse_args()
     
     if args.mode == 'single':
         print("\nRunning single fetch_repositories() call...")
-        result = fetch_repositories(
-            batch_size=args.batch_size,
-            min_stars=args.min_stars,
-            language=args.language,
-            keywords=[args.keywords] if args.keywords else None,
-            sort_by=args.sort_by,
-            created_after=args.created_after,
-            created_before=args.created_before
-        )
-        if result:
-            print(f"\nFetch completed successfully!")
-            print(f"Fetched {len(result['repositories'])} repositories")
-            print(f"Has next page: {result['has_next_page']}")
-            if result['has_next_page']:
-                print(f"Next cursor: {result['end_cursor']}")
+        
+        # Add repeat count argument
+        repeat_count = args.repeat_count if hasattr(args, 'repeat_count') else 1
+        total_fetch_time = 0
+        total_repos = 0
+        
+        for i in range(repeat_count):
+            if i > 0:  # Don't sleep before the first iteration
+                time.sleep(0.5)  # Sleep for 0.5 seconds between iterations
+                
+            print(f"\nIteration {i+1}/{repeat_count}")
+            
+            # Start timing the fetch operation
+            fetch_start_time = time.time()
+            result = fetch_repositories(
+                batch_size=args.batch_size,
+                min_stars=args.min_stars,
+                language=args.language,
+                keywords=[args.keywords] if args.keywords else None,
+                sort_by=args.sort_by,
+                created_after=args.created_after,
+                created_before=args.created_before
+            )
+            fetch_time = time.time() - fetch_start_time
+            total_fetch_time += fetch_time
+            
+            if result:
+                num_repos = len(result['repositories'])
+                total_repos += num_repos
+                print(f"\nFetch completed successfully!")
+                print(f"Fetched {num_repos} repositories")
+                print(f"Has next page: {result['has_next_page']}")
+                if result['has_next_page']:
+                    print(f"Next cursor: {result['end_cursor']}")
+                    
+                # Write to database if we have results
+                if result['repositories']:
+                    success = db_write_batch(result['repositories'])
+                    
+                    print("\nPerformance Statistics:")
+                    print(f"Fetch time: {fetch_time:.2f}s")
+                    print(f"Processing rate: {(num_repos/fetch_time):.2f} repos/second")
+                    
+                    if not success:
+                        print("Warning: Failed to write repositories to database")
+        
+        # Print average statistics after all iterations
+        if repeat_count > 1:
+            print("\n" + "="*50)
+            print("Average Performance Statistics:")
+            print(f"Total iterations: {repeat_count}")
+            print(f"Total repositories fetched: {total_repos}")
+            print(f"Average fetch time: {(total_fetch_time/repeat_count):.2f}s")
+            print(f"Average processing rate: {(total_repos/total_fetch_time):.2f} repos/second")
+            print("="*50)
     elif args.mode == 'pipeline':
         crawl_pipeline(args=args)
 
