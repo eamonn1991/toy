@@ -1,3 +1,11 @@
+# Improvement 06/14/2025
+
+## TODO
+- [Ryan/Chen] I. Experiment 1: Report the break-down of total query time
+
+- [Edison] II. Experiment 2: Report the excution time on each sub-search, e.g. 100 search entities per query.
+
+
 # GitHub Repository Crawler - Edison's Submission
 
 A high-performance, multi-threaded GitHub repository crawler that uses GraphQL API to fetch repository data efficiently. The crawler supports various search criteria and can handle rate limiting automatically.
