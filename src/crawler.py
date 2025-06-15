@@ -200,28 +200,16 @@ def fetch_repositories(
     
     query = """
     query($batch_size: Int!, $searchQuery: String!, $afterCursor: String) {
-        rateLimit {
-            limit
-            cost
-            remaining
-            resetAt
-        }
         search(query: $searchQuery, type: REPOSITORY, first: $batch_size, after: $afterCursor) {
             repositoryCount
             pageInfo {
                 hasNextPage
                 endCursor
             }
-            edges {
-                cursor
-                node {
-                    ... on Repository {
-                        id
-                        nameWithOwner
-                        stargazerCount
-                        createdAt
-                        updatedAt
-                    }
+            nodes {
+                ... on Repository {
+                    id
+                    stargazerCount
                 }
             }
         }
@@ -242,19 +230,6 @@ def fetch_repositories(
             print("GraphQL Errors:", data['errors'])
             return
             
-        # Check rate limit
-        print("*"*50 + "\nRate Limit Information\n" + "*"*50)
-        rate_limit = data['data']['rateLimit']
-        print("\nRate Limit Information:")
-        print(f"Remaining: {rate_limit['remaining']}/{rate_limit['limit']}")
-        print(f"Query Cost: {rate_limit['cost']}")
-        print(f"Reset At: {rate_limit['resetAt']}")
-        print("*"*50)
-        
-        # If we're close to rate limit, raise an exception
-        if rate_limit['remaining'] < rate_limit['cost'] * 2:  # Keep buffer for 2 queries
-            raise Exception(f"Rate limit nearly exceeded. Resets at {rate_limit['resetAt']}")
-            
         search_data = data['data']['search']
         print(f"\nSearch Query: {search_query}")
         print(f"Total number of found repo: {search_data['repositoryCount']}")
@@ -268,10 +243,9 @@ def fetch_repositories(
         if has_next_page:
             print(f"More results available. Use cursor: {end_cursor}")
         return {
-            'repositories': [edge['node'] for edge in search_data['edges']],
+            'repositories': search_data['nodes'],
             'has_next_page': has_next_page,
-            'end_cursor': end_cursor,
-            'rate_limit': rate_limit
+            'end_cursor': end_cursor
         }
     else:
         print(f"Error: {response.status_code}")
@@ -286,9 +260,7 @@ def db_write_batch(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1) -
     Expected format for each dictionary:
     {
         "id": "ID",
-        "nameWithOwner": "owner/repo",
-        "stargazerCount": 100,
-        "updatedAt": "2024-03-20T10:00:00Z"
+        "stargazerCount": 100
     }
     """
     if not repo_data_list:
@@ -313,9 +285,7 @@ def db_write_batch(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1) -
             for repo_data in repo_data_list:
                 repo = Repository(
                     id=repo_data["id"],
-                    name=repo_data["nameWithOwner"],
                     star_count=repo_data["stargazerCount"],
-                    updated_at=datetime.strptime(repo_data["updatedAt"], "%Y-%m-%dT%H:%M:%SZ"),
                     last_crawled_at=current_time
                 )
                 
@@ -628,62 +598,118 @@ def main():
     args = parser.parse_args()
     
     if args.mode == 'single':
-        print("\nRunning single fetch_repositories() call...")
+        print("\nRunning multi-threaded single fetch_repositories() call...")
         
         # Add repeat count argument
         repeat_count = args.repeat_count if hasattr(args, 'repeat_count') else 1
-        total_fetch_time = 0
-        total_repos = 0
+        num_threads = args.num_threads
         
-        for i in range(repeat_count):
-            if i > 0:  # Don't sleep before the first iteration
-                time.sleep(0.5)  # Sleep for 0.5 seconds between iterations
+        # Initialize shared counters
+        shared_counters = {
+            'total_fetch_time': ThreadSafeCounter(0),
+            'total_repos': ThreadSafeCounter(0),
+            'print_lock': Lock()
+        }
+        
+        # Record total start time
+        total_start_time = time.time()
+        
+        def single_worker(thread_id):
+            thread_fetch_time = 0
+            thread_repos = 0
+            
+            for i in range(repeat_count):
+                if i > 0:  # Don't sleep before the first iteration
+                    time.sleep(0.02)  # Sleep for 1 seconds between repetitions
                 
-            print(f"\nIteration {i+1}/{repeat_count}")
+                with shared_counters['print_lock']:
+                    print(f"\nThread {thread_id} - Iteration {i+1}/{repeat_count}")
+                
+                # Start timing the fetch operation
+                fetch_start_time = time.time()
+                result = fetch_repositories(
+                    batch_size=args.batch_size,
+                    min_stars=args.min_stars,
+                    language=args.language,
+                    keywords=[args.keywords] if args.keywords else None,
+                    sort_by=args.sort_by,
+                    created_after=args.created_after,
+                    created_before=args.created_before
+                )
+                fetch_time = time.time() - fetch_start_time
+                thread_fetch_time += fetch_time
+                
+                if result:
+                    num_repos = len(result['repositories'])
+                    thread_repos += num_repos
+                    
+                    with shared_counters['print_lock']:
+                        print(f"\nThread {thread_id} - Fetch completed successfully!")
+                        print(f"Fetched {num_repos} repositories")
+                        print(f"Has next page: {result['has_next_page']}")
+                        if result['has_next_page']:
+                            print(f"Next cursor: {result['end_cursor']}")
+                        
+                        print("\nPerformance Statistics:")
+                        print(f"Fetch time: {fetch_time:.2f}s")
+                        print(f"Processing rate: {(num_repos/fetch_time):.2f} repos/second")
+                    
+                    # Write to database if we have results
+                    if result['repositories']:
+                        success = db_write_batch(result['repositories'])
+                        if not success:
+                            with shared_counters['print_lock']:
+                                print(f"Thread {thread_id} - Warning: Failed to write repositories to database")
             
-            # Start timing the fetch operation
-            fetch_start_time = time.time()
-            result = fetch_repositories(
-                batch_size=args.batch_size,
-                min_stars=args.min_stars,
-                language=args.language,
-                keywords=[args.keywords] if args.keywords else None,
-                sort_by=args.sort_by,
-                created_after=args.created_after,
-                created_before=args.created_before
-            )
-            fetch_time = time.time() - fetch_start_time
-            total_fetch_time += fetch_time
+            # Update shared counters
+            shared_counters['total_fetch_time'].increment(thread_fetch_time)
+            shared_counters['total_repos'].increment(thread_repos)
             
-            if result:
-                num_repos = len(result['repositories'])
-                total_repos += num_repos
-                print(f"\nFetch completed successfully!")
-                print(f"Fetched {num_repos} repositories")
-                print(f"Has next page: {result['has_next_page']}")
-                if result['has_next_page']:
-                    print(f"Next cursor: {result['end_cursor']}")
-                    
-                # Write to database if we have results
-                if result['repositories']:
-                    success = db_write_batch(result['repositories'])
-                    
-                    print("\nPerformance Statistics:")
-                    print(f"Fetch time: {fetch_time:.2f}s")
-                    print(f"Processing rate: {(num_repos/fetch_time):.2f} repos/second")
-                    
-                    if not success:
-                        print("Warning: Failed to write repositories to database")
+            with shared_counters['print_lock']:
+                print(f"\nThread {thread_id} Summary:")
+                print(f"Total fetch time: {thread_fetch_time:.2f}s")
+                print(f"Total repositories: {thread_repos}")
+                print(f"Average fetch time: {(thread_fetch_time/repeat_count):.2f}s")
+                print(f"Average processing rate: {(thread_repos/thread_fetch_time):.2f} repos/second")
         
-        # Print average statistics after all iterations
-        if repeat_count > 1:
-            print("\n" + "="*50)
-            print("Average Performance Statistics:")
-            print(f"Total iterations: {repeat_count}")
-            print(f"Total repositories fetched: {total_repos}")
-            print(f"Average fetch time: {(total_fetch_time/repeat_count):.2f}s")
-            print(f"Average processing rate: {(total_repos/total_fetch_time):.2f} repos/second")
-            print("="*50)
+        # Create thread pool and start crawling
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = []
+            for i in range(num_threads):
+                futures.append(executor.submit(single_worker, i))
+                time.sleep(0.005)  # Sleep for 0.1 seconds between thread starts
+            
+            # Wait for all threads to complete
+            for future in futures:
+                future.result()
+        
+        # Calculate total wall clock time
+        total_wall_time = time.time() - total_start_time
+        
+        # Print final summary
+        total_fetch_time = shared_counters['total_fetch_time'].get()
+        total_repos = shared_counters['total_repos'].get()
+        total_iterations = repeat_count * num_threads
+        
+        print("\n" + "="*50)
+        print("Final Performance Statistics:")
+        print(f"Total threads: {num_threads}")
+        print(f"Total iterations: {total_iterations}")
+        print(f"Total repositories fetched: {total_repos}")
+        print(f"Total wall clock time: {total_wall_time:.2f}s")
+        print(f"Total fetch time (excluding sleeps): {total_fetch_time:.2f}s")
+        print(f"Average fetch time per iteration: {(total_fetch_time/total_iterations):.2f}s")
+        print(f"Raw processing rate: {(total_repos/total_fetch_time):.2f} repos/second")
+        print(f"Effective processing rate: {(total_repos/total_wall_time):.2f} repos/second")
+        
+        # Calculate estimated time for 100k repos
+        effective_rate = total_repos/total_wall_time
+        time_for_100k = 100000/effective_rate
+        hours = int(time_for_100k // 3600)
+        minutes = int((time_for_100k % 3600) // 60)
+        seconds = int(time_for_100k % 60)
+        print(f"Estimated time for 100k repos: {hours}h {minutes}m {seconds}s")
+        print("="*50)
     elif args.mode == 'pipeline':
         crawl_pipeline(args=args)
 
