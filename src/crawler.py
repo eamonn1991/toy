@@ -150,7 +150,7 @@ def build_search_query(
     - sort_by: How to sort results ("stars", "updated", "created", "forks")
     """
     # Start with base query
-    query_parts = []
+    query_parts = ['is:public']
     
     # Add keywords if provided
     if keywords:
@@ -206,15 +206,10 @@ def fetch_repositories(
         keywords=keywords,
         sort_by=sort_by
     )
-    
+    # print(search_query)
     query = """
     query($batch_size: Int!, $searchQuery: String!, $afterCursor: String) {
         search(query: $searchQuery, type: REPOSITORY, first: $batch_size, after: $afterCursor) {
-            repositoryCount
-            pageInfo {
-                hasNextPage
-                endCursor
-            }
             nodes {
                 ... on Repository {
                     id
@@ -240,18 +235,16 @@ def fetch_repositories(
             return
             
         search_data = data['data']['search']
-        total_found = search_data['repositoryCount']
         
-        # Pagination information
-        page_info = search_data['pageInfo']
-        has_next_page = page_info['hasNextPage']
-        end_cursor = page_info['endCursor']
+        # Pagination disabled for speed - removed pageInfo fields
+        has_next_page = False  # No more pagination for maximum speed
+        end_cursor = None
         
         return {
             'repositories': search_data['nodes'],
             'has_next_page': has_next_page,
             'end_cursor': end_cursor,
-            'total_found': total_found
+            'total_found': 'N/A'  # Removed repositoryCount for speed
         }
     else:
         print(f"Error: {response.status_code}")
@@ -418,7 +411,7 @@ def crawl_worker(args, date_range_queue, shared_counters, thread_key, max_retrie
                         
                         with shared_counters['print_lock']:
                             total_found = crawl_result.get('total_found', 'N/A')
-                            print(f"T{thread_key[-1]} +{num_fetched} repos | Found: {total_found} | Total: {shared_counters['total'].get()}/{target_total} | C:{crawl_time:.1f}s W:{write_time:.1f}s")
+                            # print(f"T{thread_key[-1]} +{num_fetched} repos | Found: {total_found} | Total: {shared_counters['total'].get()}/{target_total} | C:{crawl_time:.1f}s W:{write_time:.1f}s")
                         
                         count_current_partition += num_fetched
                         
@@ -573,7 +566,7 @@ def main():
             
             for i in range(repeat_count):
                 if i > 0:  # Don't sleep before the first iteration
-                    time.sleep(15)  # Sleep for 20ms between repetitions
+                    time.sleep(5)  # Sleep for 20ms between repetitions
                 
                 # Get unique date range for this iteration (thread-safe)
                 year, month, day = date_range_queue.get_next_date_range()
@@ -602,7 +595,7 @@ def main():
                     
                     with shared_counters['print_lock']:
                         total_found = result.get('total_found', 'N/A')
-                        print(f"T{thread_id} +{num_repos} repos | Found: {total_found} | Time: {fetch_time:.1f}s")
+                        # print(f"T{thread_id} +{num_repos} repos | Found: {total_found} | Time: {fetch_time:.1f}s")
                     
                     # Write to database if we have results
                     # if result['repositories']:
