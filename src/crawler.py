@@ -276,8 +276,6 @@ def db_write_batch(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1) -
                 ).all()
             }
             
-            current_time = datetime.utcnow()
-            
             # Prepare updates and inserts
             to_update = []
             to_insert = []
@@ -285,8 +283,7 @@ def db_write_batch(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1) -
             for repo_data in repo_data_list:
                 repo = Repository(
                     id=repo_data["id"],
-                    star_count=repo_data["stargazerCount"],
-                    last_crawled_at=current_time
+                    star_count=repo_data["stargazerCount"]
                 )
                 
                 if repo.id in existing_repos:
