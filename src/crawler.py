@@ -60,31 +60,40 @@ class ThreadSafeDateRangeQueue:
     """
     Thread-safe queue for distributing date ranges to crawler threads.
     Prevents multiple threads from working on the same time period.
+    Now works with daily periods instead of monthly.
     """
     def __init__(self, start_year, start_month):
         self.current_year = start_year
         self.current_month = start_month
+        self.current_day = calendar.monthrange(start_year, start_month)[1]  # Start from last day of month
         self.lock = Lock()
         self.assigned_ranges = set()  # Track assigned ranges for debugging
         
     def get_next_date_range(self):
-        """Get the next available date range in a thread-safe manner"""
+        """Get the next available date range (single day) in a thread-safe manner"""
         with self.lock:
             year = self.current_year
             month = self.current_month
+            day = self.current_day
             
             # Create range identifier for tracking
-            range_id = f"{year}-{month:02d}"
+            range_id = f"{year}-{month:02d}-{day:02d}"
             self.assigned_ranges.add(range_id)
             
-            # Move to next date range for future requests
-            if month == 1:
-                self.current_year = year - 1
-                self.current_month = 12
+            # Move to next date for future requests (go backwards in time)
+            if day == 1:
+                # Move to previous month
+                if month == 1:
+                    self.current_year = year - 1
+                    self.current_month = 12
+                else:
+                    self.current_month = month - 1
+                # Set to last day of new month
+                self.current_day = calendar.monthrange(self.current_year, self.current_month)[1]
             else:
-                self.current_month = month - 1
+                self.current_day = day - 1
                 
-            return year, month
+            return year, month, day
     
     def get_assigned_count(self):
         """Get number of assigned date ranges (for debugging)"""
@@ -231,31 +240,28 @@ def fetch_repositories(
             return
             
         search_data = data['data']['search']
-        print(f"\nSearch Query: {search_query}")
-        print(f"Total number of found repo: {search_data['repositoryCount']}")
+        total_found = search_data['repositoryCount']
         
         # Pagination information
         page_info = search_data['pageInfo']
         has_next_page = page_info['hasNextPage']
         end_cursor = page_info['endCursor']
         
-        print(f"Showing {batch_size} repositories:")
-        if has_next_page:
-            print(f"More results available. Use cursor: {end_cursor}")
         return {
             'repositories': search_data['nodes'],
             'has_next_page': has_next_page,
-            'end_cursor': end_cursor
+            'end_cursor': end_cursor,
+            'total_found': total_found
         }
     else:
         print(f"Error: {response.status_code}")
         print(response.text)
         return None
 
-def db_write_batch(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1) -> bool:
+def db_write_batch(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1, db_lock=None) -> bool:
     """
     Write a batch of repository data to the database with retry mechanism.
-    Only updates repositories if their star count has changed.
+    Uses merge() to handle both inserts and updates automatically.
     
     Expected format for each dictionary:
     {
@@ -267,52 +273,37 @@ def db_write_batch(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1) -
         return True
 
     for retry_count in range(max_retries):
-        db = next(get_db())
-        try:
-            # Get all existing repositories with their current star counts
-            existing_repos = {
-                r.id: r for r in db.query(Repository).filter(
-                    Repository.id.in_([r["id"] for r in repo_data_list])
-                ).all()
-            }
-            
-            # Prepare updates and inserts
-            to_update = []
-            to_insert = []
-            
-            for repo_data in repo_data_list:
-                repo = Repository(
-                    id=repo_data["id"],
-                    star_count=repo_data["stargazerCount"]
-                )
-                
-                if repo.id in existing_repos:
-                    # Only update if star count has changed
-                    existing_repo = existing_repos[repo.id]
-                    if existing_repo.star_count != repo.star_count:
-                        to_update.append(repo)
-                else:
-                    to_insert.append(repo)
-            
-            # Bulk insert new repositories
-            if to_insert:
-                db.bulk_save_objects(to_insert)
-            
-            # Bulk update repositories with changed star counts
-            if to_update:
-                for repo in to_update:
-                    db.merge(repo)
-            
-            db.commit()
-            return True
-            
-        except Exception as e:
-            print(f"Error in db_write_batch: {str(e)}")
-            db.rollback()
-            if retry_count == max_retries - 1:
-                return False
-        finally:
-            db.close()
+        # Use database lock to limit concurrent connections
+        if db_lock:
+            with db_lock:
+                return _write_to_db(repo_data_list, retry_count, max_retries)
+        else:
+            return _write_to_db(repo_data_list, retry_count, max_retries)
+    
+    return False
+
+def _write_to_db(repo_data_list, retry_count, max_retries):
+    """Helper function to actually write to database"""
+    db = next(get_db())
+    try:
+        # Use merge for all operations - handles both insert and update
+        for repo_data in repo_data_list:
+            repo = Repository(
+                id=repo_data["id"],
+                star_count=repo_data["stargazerCount"]
+            )
+            db.merge(repo)
+        
+        db.commit()
+        return True
+        
+    except Exception as e:
+        print(f"Error in db_write_batch: {str(e)}")
+        db.rollback()
+        if retry_count == max_retries - 1:
+            return False
+    finally:
+        db.close()
     
     return False
 
@@ -329,6 +320,14 @@ def wait_for_rate_limit_reset(reset_at):
     if wait_seconds > 0:
         print(f"Rate limit reached. Waiting for {wait_seconds/60:.2f} minutes until {reset_at}")
         time.sleep(wait_seconds + 1)  # Add 1 second buffer
+
+def get_day_date_range(year, month, day):
+    """
+    Returns the start and end date for a single day.
+    Both start_date and end_date will be the same day.
+    """
+    date_str = f"{year}-{month:02d}-{day:02d}"
+    return date_str, date_str
 
 def get_month_date_range(year, month):
     """
@@ -357,18 +356,17 @@ def crawl_worker(args, date_range_queue, shared_counters, thread_key, max_retrie
         
         while not check_total_repos(shared_counters, target_total):
             # Get next date range from centralized queue (thread-safe)
-            year, month = date_range_queue.get_next_date_range()
+            year, month, day = date_range_queue.get_next_date_range()
             
             # Set date range once for this iteration (outside pagination loop)
-            created_after, created_before = get_month_date_range(year, month)
+            created_after, created_before = get_day_date_range(year, month, day)
             
             count_current_partition = 0
             after_cursor = None
             flag_no_more_page = False
             
             with shared_counters['print_lock']:
-                print(f"Thread {thread_key} assigned new date range: {year}-{month:02d} ({created_after} to {created_before})")
-                print(f"Total date ranges assigned: {date_range_queue.get_assigned_count()}")
+                print(f"T{thread_key[-1]} -> {year}-{month:02d}-{day:02d}")
             
             while not flag_no_more_page and count_current_partition < args.partition_threshold:
                 if check_total_repos(shared_counters, target_total):
@@ -379,10 +377,6 @@ def crawl_worker(args, date_range_queue, shared_counters, thread_key, max_retrie
                 retry_count = 0
                 while retry_count < max_retries:
                     try:
-                        with shared_counters['print_lock']:
-                            print(f"Thread {thread_key} ({year}-{month:02d}) fetching from {created_after} to {created_before}")
-                            print(f"Progress: {shared_counters['total'].get()}/{target_total} repositories")
-                        
                         crawl_start_time = time.time()
                         
                         crawl_result = fetch_repositories(
@@ -407,9 +401,9 @@ def crawl_worker(args, date_range_queue, shared_counters, thread_key, max_retrie
                         
                         write_start_time = time.time()
                         
-                        if not db_write_batch(list_repo_data, max_retries=max_retries):
+                        if not db_write_batch(list_repo_data, max_retries=max_retries, db_lock=shared_counters['db_lock']):
                             with shared_counters['print_lock']:
-                                print("Failed to write batch to database, skipping this batch...")
+                                print(f"T{thread_key[-1]} DB write failed, skipping batch")
                             continue
                         
                         write_time = time.time() - write_start_time
@@ -423,14 +417,8 @@ def crawl_worker(args, date_range_queue, shared_counters, thread_key, max_retrie
                         shared_counters['total'].increment(num_fetched)
                         
                         with shared_counters['print_lock']:
-                            print(f"Thread {thread_key} ({year}-{month:02d}) fetched and saved {num_fetched} repositories")
-                            print(f"Thread total: {shared_counters['thread_counts'][thread_key].get()}")
-                            print(f"Crawl time: {crawl_time:.2f}s, Write time: {write_time:.2f}s")
-                            
-                            if shared_counters['crawl_ops'].get() > 0 and shared_counters['write_ops'].get() > 0:
-                                avg_crawl = shared_counters['crawl_time'].get() / shared_counters['crawl_ops'].get()
-                                avg_write = shared_counters['write_time'].get() / shared_counters['write_ops'].get()
-                                print(f"Average times - Crawl: {avg_crawl:.2f}s, Write: {avg_write:.2f}s")
+                            total_found = crawl_result.get('total_found', 'N/A')
+                            print(f"T{thread_key[-1]} +{num_fetched} repos | Found: {total_found} | Total: {shared_counters['total'].get()}/{target_total} | C:{crawl_time:.1f}s W:{write_time:.1f}s")
                         
                         count_current_partition += num_fetched
                         
@@ -438,14 +426,14 @@ def crawl_worker(args, date_range_queue, shared_counters, thread_key, max_retrie
                             after_cursor = crawl_result['end_cursor']
                         else:
                             with shared_counters['print_lock']:
-                                print(f"No more repositories for {year}-{month:02d}")
+                                print(f"T{thread_key[-1]} completed {year}-{month:02d}-{day:02d}")
                             flag_no_more_page = True
                             break
                             
                     except Exception as e:
                         error_msg = str(e)
                         with shared_counters['print_lock']:
-                            print(f"API Error occurred in thread {thread_key} ({year}-{month:02d}): {error_msg}")
+                            print(f"T{thread_key[-1]} Error: {error_msg}")
                         
                         if "Rate limit nearly exceeded" in error_msg:
                             reset_at = error_msg.split("Resets at ")[-1]
@@ -455,20 +443,20 @@ def crawl_worker(args, date_range_queue, shared_counters, thread_key, max_retrie
                         retry_count += 1
                         if retry_count >= max_retries:
                             with shared_counters['print_lock']:
-                                print(f"Max retries reached for thread {thread_key} ({year}-{month:02d}). Moving to next date range...")
+                                print(f"T{thread_key[-1]} Max retries reached, moving to next range")
                             flag_no_more_page = True
                             break
                         with shared_counters['print_lock']:
-                            print(f"Retrying in 2 seconds... (Attempt {retry_count + 1}/{max_retries})")
+                            print(f"T{thread_key[-1]} Retry {retry_count + 1}/{max_retries} in 2s...")
                         time.sleep(2)
             
             # This date range is complete, thread will get next range from queue in next iteration
-            with shared_counters['print_lock']:
-                print(f"Thread {thread_key} completed date range {year}-{month:02d}")
+            # with shared_counters['print_lock']:
+            #     print(f"Thread {thread_key} completed date range {year}-{month:02d}")
                     
     except Exception as e:
         with shared_counters['print_lock']:
-            print(f"Error in crawl_worker for thread {thread_key}: {e}")
+            print(f"T{thread_key[-1]} Worker error: {e}")
 
 def crawl_pipeline(args, max_retries=None):
     try:
@@ -478,8 +466,7 @@ def crawl_pipeline(args, max_retries=None):
         # Set number of threads for parallel processing
         num_threads = args.num_threads
         target_total = args.total_num_repo if args.total_num_repo else settings.total_num_repo
-        print(f"Starting multi-threaded crawl with {num_threads} threads (using GitHub token)")
-        print(f"Target total repositories: {target_total}")
+        print(f"Starting crawl: {num_threads} threads, target: {target_total} repos")
 
         # Create centralized date range queue to prevent thread collisions
         date_range_queue = ThreadSafeDateRangeQueue(args.start_year, args.start_month)
@@ -492,13 +479,9 @@ def crawl_pipeline(args, max_retries=None):
             'crawl_ops': ThreadSafeCounter(0),
             'write_ops': ThreadSafeCounter(0),
             'print_lock': Lock(),
+            'db_lock': Lock(),  # Add database lock to prevent too many connections
             'thread_counts': {}  # Track per-thread counts
         }
-
-        print("*"*80 + "\nGITHUB REPO Crawling...\n" + "*"*80)
-        print(f"Starting with date range: {args.start_year}-{args.start_month:02d}")
-        print(f"Using centralized date range queue to prevent thread collisions")
-        print(f"Target total repositories: {target_total}\n")
         
         # Record start time for wall clock timing
         total_start_time = time.time()
@@ -527,42 +510,11 @@ def crawl_pipeline(args, max_retries=None):
         # Calculate total wall clock time
         total_wall_time = time.time() - total_start_time
         
-        print("\n" + "*"*80 + "\nFinal Performance Statistics\n" + "*"*80)
+        print(f"\nCompleted: {shared_counters['total'].get()} repos in {total_wall_time:.1f}s")
         
-        # Verify total count
-        total_from_threads = sum(counter.get() for counter in shared_counters['thread_counts'].values())
-        total_reported = shared_counters['total'].get()
-        
-        print("\nRepository Count Verification:")
-        print(f"Total from thread counters: {total_from_threads}")
-        print(f"Total from shared counter: {total_reported}")
-        
-        if total_from_threads != total_reported:
-            print(f"WARNING: Count mismatch detected! Difference: {abs(total_from_threads - total_reported)}")
-            print("\nPer-thread counts:")
-            for thread_key, counter in shared_counters['thread_counts'].items():
-                print(f"  {thread_key}: {counter.get()}")
-        
-        print(f"\nTotal repositories fetched: {total_from_threads}")
-        
-        if shared_counters['crawl_ops'].get() > 0 and shared_counters['write_ops'].get() > 0:
-            total_crawl_time = shared_counters['crawl_time'].get()
-            total_write_time = shared_counters['write_time'].get()
-            total_crawl_ops = shared_counters['crawl_ops'].get()
-            total_write_ops = shared_counters['write_ops'].get()
-            
-            print(f"\nOperation Statistics:")
-            print(f"Total operations - Crawl: {total_crawl_ops}, Write: {total_write_ops}")
-            print(f"Average time per operation:")
-            print(f"  - Crawl: {(total_crawl_time/total_crawl_ops):.2f}s")
-            print(f"  - Write: {(total_write_time/total_write_ops):.2f}s")
-            print(f"\nParallel execution statistics ({num_threads} threads):")
-            print(f"  - Total wall clock time: {total_wall_time:.2f}s")
-            print(f"  - Cumulative crawl time: {total_crawl_time:.2f}s")
-            print(f"  - Cumulative write time: {total_write_time:.2f}s")
-            print(f"  - Cumulative processing time: {(total_crawl_time + total_write_time):.2f}s")
-            print(f"  - Effective parallel speedup: {((total_crawl_time + total_write_time)/total_wall_time):.2f}x")
-            print(f"  - Average processing rate: {(total_from_threads/total_wall_time):.2f} repos/second")
+        if shared_counters['crawl_ops'].get() > 0:
+            avg_rate = shared_counters['total'].get() / total_wall_time
+            print(f"Processing rate: {avg_rate:.1f} repos/sec")
             
     except Exception as e:
         print(f"Error in crawl_pipeline: {e}")
@@ -590,22 +542,26 @@ def main():
     parser.add_argument('--total-num-repo', type=int, help='Override total number of repositories to fetch')
     parser.add_argument('--num-threads', type=int, default=settings.default_number_threads,
                       help='Number of threads to use for crawling (default: 4)')
-    parser.add_argument('--repeat-count', type=int, help='Number of times to repeat the single fetch operation')
+    parser.add_argument('--repeat-count', type=int, default =1, help='Number of times to repeat the single fetch operation')
 
     args = parser.parse_args()
     
     if args.mode == 'single':
-        print("\nRunning multi-threaded single fetch_repositories() call...")
+        print("\nRunning multi-threaded single fetch with different date ranges per thread...")
         
         # Add repeat count argument
         repeat_count = args.repeat_count if hasattr(args, 'repeat_count') else 1
         num_threads = args.num_threads
         
+        # Create centralized date range queue to prevent thread collisions
+        date_range_queue = ThreadSafeDateRangeQueue(args.start_year, args.start_month)
+        
         # Initialize shared counters
         shared_counters = {
             'total_fetch_time': ThreadSafeCounter(0),
             'total_repos': ThreadSafeCounter(0),
-            'print_lock': Lock()
+            'print_lock': Lock(),
+            'db_lock': Lock()  # Add database lock to prevent too many connections
         }
         
         # Record total start time
@@ -617,10 +573,14 @@ def main():
             
             for i in range(repeat_count):
                 if i > 0:  # Don't sleep before the first iteration
-                    time.sleep(0.02)  # Sleep for 1 seconds between repetitions
+                    time.sleep(15)  # Sleep for 20ms between repetitions
+                
+                # Get unique date range for this iteration (thread-safe)
+                year, month, day = date_range_queue.get_next_date_range()
+                created_after, created_before = get_day_date_range(year, month, day)
                 
                 with shared_counters['print_lock']:
-                    print(f"\nThread {thread_id} - Iteration {i+1}/{repeat_count}")
+                    print(f"T{thread_id} iter {i+1}/{repeat_count} -> {year}-{month:02d}-{day:02d}")
                 
                 # Start timing the fetch operation
                 fetch_start_time = time.time()
@@ -630,8 +590,8 @@ def main():
                     language=args.language,
                     keywords=[args.keywords] if args.keywords else None,
                     sort_by=args.sort_by,
-                    created_after=args.created_after,
-                    created_before=args.created_before
+                    created_after=created_after,
+                    created_before=created_before
                 )
                 fetch_time = time.time() - fetch_start_time
                 thread_fetch_time += fetch_time
@@ -641,40 +601,29 @@ def main():
                     thread_repos += num_repos
                     
                     with shared_counters['print_lock']:
-                        print(f"\nThread {thread_id} - Fetch completed successfully!")
-                        print(f"Fetched {num_repos} repositories")
-                        print(f"Has next page: {result['has_next_page']}")
-                        if result['has_next_page']:
-                            print(f"Next cursor: {result['end_cursor']}")
-                        
-                        print("\nPerformance Statistics:")
-                        print(f"Fetch time: {fetch_time:.2f}s")
-                        print(f"Processing rate: {(num_repos/fetch_time):.2f} repos/second")
+                        total_found = result.get('total_found', 'N/A')
+                        print(f"T{thread_id} +{num_repos} repos | Found: {total_found} | Time: {fetch_time:.1f}s")
                     
                     # Write to database if we have results
-                    if result['repositories']:
-                        success = db_write_batch(result['repositories'])
-                        if not success:
-                            with shared_counters['print_lock']:
-                                print(f"Thread {thread_id} - Warning: Failed to write repositories to database")
+                    # if result['repositories']:
+                    #     success = db_write_batch(result['repositories'], db_lock=shared_counters['db_lock'])
+                    #     if not success:
+                    #         with shared_counters['print_lock']:
+                    #             print(f"T{thread_id} DB write failed")
             
             # Update shared counters
             shared_counters['total_fetch_time'].increment(thread_fetch_time)
             shared_counters['total_repos'].increment(thread_repos)
             
             with shared_counters['print_lock']:
-                print(f"\nThread {thread_id} Summary:")
-                print(f"Total fetch time: {thread_fetch_time:.2f}s")
-                print(f"Total repositories: {thread_repos}")
-                print(f"Average fetch time: {(thread_fetch_time/repeat_count):.2f}s")
-                print(f"Average processing rate: {(thread_repos/thread_fetch_time):.2f} repos/second")
+                print(f"T{thread_id} total: {thread_repos} repos in {thread_fetch_time:.1f}s")
         
         # Create thread pool and start crawling
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = []
             for i in range(num_threads):
                 futures.append(executor.submit(single_worker, i))
-                time.sleep(0.005)  # Sleep for 0.1 seconds between thread starts
+                time.sleep(0.004)  # Sleep for 0.1 seconds between thread starts
             
             # Wait for all threads to complete
             for future in futures:
@@ -688,16 +637,7 @@ def main():
         total_repos = shared_counters['total_repos'].get()
         total_iterations = repeat_count * num_threads
         
-        print("\n" + "="*50)
-        print("Final Performance Statistics:")
-        print(f"Total threads: {num_threads}")
-        print(f"Total iterations: {total_iterations}")
-        print(f"Total repositories fetched: {total_repos}")
-        print(f"Total wall clock time: {total_wall_time:.2f}s")
-        print(f"Total fetch time (excluding sleeps): {total_fetch_time:.2f}s")
-        print(f"Average fetch time per iteration: {(total_fetch_time/total_iterations):.2f}s")
-        print(f"Raw processing rate: {(total_repos/total_fetch_time):.2f} repos/second")
-        print(f"Effective processing rate: {(total_repos/total_wall_time):.2f} repos/second")
+        print(f"\nFinal: {total_repos} repos in {total_wall_time:.1f}s ({(total_repos/total_wall_time):.1f} repos/sec)")
         
         # Calculate estimated time for 100k repos
         effective_rate = total_repos/total_wall_time
@@ -705,8 +645,7 @@ def main():
         hours = int(time_for_100k // 3600)
         minutes = int((time_for_100k % 3600) // 60)
         seconds = int(time_for_100k % 60)
-        print(f"Estimated time for 100k repos: {hours}h {minutes}m {seconds}s")
-        print("="*50)
+        print(f"Est. time for 100k repos: {hours}h {minutes}m {seconds}s")
     elif args.mode == 'pipeline':
         crawl_pipeline(args=args)
 
