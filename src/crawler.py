@@ -8,7 +8,7 @@ import logging
 from typing import Dict, Any, List
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
+from threading import Lock, Semaphore
 
 from src.models import Repository, get_db
 from src.config import settings
@@ -251,10 +251,10 @@ def fetch_repositories(
         print(response.text)
         return None
 
-def db_write_batch(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1, db_lock=None) -> bool:
+def db_write_batch(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1, db_semaphore=None) -> bool:
     """
     Write a batch of repository data to the database with retry mechanism.
-    Uses merge() to handle both inserts and updates automatically.
+    Uses efficient bulk operations with limited concurrent connections.
     
     Expected format for each dictionary:
     {
@@ -265,38 +265,46 @@ def db_write_batch(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1, d
     if not repo_data_list:
         return True
 
-    for retry_count in range(max_retries):
-        # Use database lock to limit concurrent connections
-        if db_lock:
-            with db_lock:
-                return _write_to_db(repo_data_list, retry_count, max_retries)
-        else:
-            return _write_to_db(repo_data_list, retry_count, max_retries)
-    
-    return False
+    # Use semaphore to limit concurrent database connections
+    if db_semaphore:
+        with db_semaphore:
+            return _write_to_db_bulk(repo_data_list, max_retries)
+    else:
+        return _write_to_db_bulk(repo_data_list, max_retries)
 
-def _write_to_db(repo_data_list, retry_count, max_retries):
-    """Helper function to actually write to database"""
-    db = next(get_db())
-    try:
-        # Use merge for all operations - handles both insert and update
-        for repo_data in repo_data_list:
-            repo = Repository(
-                id=repo_data["id"],
-                star_count=repo_data["stargazerCount"]
+def _write_to_db_bulk(repo_data_list: List[Dict[Any, Any]], max_retries: int = 1) -> bool:
+    """Helper function to perform the actual bulk database write"""
+    for retry_count in range(max_retries):
+        db = next(get_db())
+        try:
+            # Prepare data for bulk insert
+            repo_mappings = []
+            for repo_data in repo_data_list:
+                repo_mappings.append({
+                    'id': repo_data["id"],
+                    'star_count': repo_data["stargazerCount"]
+                })
+            
+            # Use bulk_insert_mappings with ON CONFLICT DO UPDATE for PostgreSQL
+            from sqlalchemy.dialects.postgresql import insert
+            
+            stmt = insert(Repository.__table__).values(repo_mappings)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=['id'],
+                set_=dict(star_count=stmt.excluded.star_count)
             )
-            db.merge(repo)
-        
-        db.commit()
-        return True
-        
-    except Exception as e:
-        print(f"Error in db_write_batch: {str(e)}")
-        db.rollback()
-        if retry_count == max_retries - 1:
-            return False
-    finally:
-        db.close()
+            
+            db.execute(stmt)
+            db.commit()
+            return True
+            
+        except Exception as e:
+            print(f"Error in db_write_batch: {str(e)}")
+            db.rollback()
+            if retry_count == max_retries - 1:
+                return False
+        finally:
+            db.close()
     
     return False
 
@@ -358,8 +366,8 @@ def crawl_worker(args, date_range_queue, shared_counters, thread_key, max_retrie
             after_cursor = None
             flag_no_more_page = False
             
-            with shared_counters['print_lock']:
-                print(f"T{thread_key[-1]} -> {year}-{month:02d}-{day:02d}")
+            # with shared_counters['print_lock']:
+            #     print(f"T{thread_key[-1]} -> {year}-{month:02d}-{day:02d}")
             
             while not flag_no_more_page and count_current_partition < args.partition_threshold:
                 if check_total_repos(shared_counters, target_total):
@@ -394,7 +402,7 @@ def crawl_worker(args, date_range_queue, shared_counters, thread_key, max_retrie
                         
                         write_start_time = time.time()
                         
-                        if not db_write_batch(list_repo_data, max_retries=max_retries, db_lock=shared_counters['db_lock']):
+                        if not db_write_batch(list_repo_data, max_retries=max_retries, db_semaphore=shared_counters['db_semaphore']):
                             with shared_counters['print_lock']:
                                 print(f"T{thread_key[-1]} DB write failed, skipping batch")
                             continue
@@ -472,7 +480,7 @@ def crawl_pipeline(args, max_retries=None):
             'crawl_ops': ThreadSafeCounter(0),
             'write_ops': ThreadSafeCounter(0),
             'print_lock': Lock(),
-            'db_lock': Lock(),  # Add database lock to prevent too many connections
+            'db_semaphore': Semaphore(3),  # Allow max 3 concurrent database connections
             'thread_counts': {}  # Track per-thread counts
         }
         
@@ -554,7 +562,7 @@ def main():
             'total_fetch_time': ThreadSafeCounter(0),
             'total_repos': ThreadSafeCounter(0),
             'print_lock': Lock(),
-            'db_lock': Lock()  # Add database lock to prevent too many connections
+            'db_semaphore': Semaphore(3)  # Allow max 3 concurrent database connections
         }
         
         # Record total start time
@@ -572,8 +580,8 @@ def main():
                 year, month, day = date_range_queue.get_next_date_range()
                 created_after, created_before = get_day_date_range(year, month, day)
                 
-                with shared_counters['print_lock']:
-                    print(f"T{thread_id} iter {i+1}/{repeat_count} -> {year}-{month:02d}-{day:02d}")
+                # with shared_counters['print_lock']:
+                #     print(f"T{thread_id} iter {i+1}/{repeat_count} -> {year}-{month:02d}-{day:02d}")
                 
                 # Start timing the fetch operation
                 fetch_start_time = time.time()
@@ -598,25 +606,25 @@ def main():
                         # print(f"T{thread_id} +{num_repos} repos | Found: {total_found} | Time: {fetch_time:.1f}s")
                     
                     # Write to database if we have results
-                    # if result['repositories']:
-                    #     success = db_write_batch(result['repositories'], db_lock=shared_counters['db_lock'])
-                    #     if not success:
-                    #         with shared_counters['print_lock']:
-                    #             print(f"T{thread_id} DB write failed")
+                    if result['repositories']:
+                        success = db_write_batch(result['repositories'], db_semaphore=shared_counters['db_semaphore'])
+                        if not success:
+                            with shared_counters['print_lock']:
+                                print(f"T{thread_id} DB write failed")
             
             # Update shared counters
             shared_counters['total_fetch_time'].increment(thread_fetch_time)
             shared_counters['total_repos'].increment(thread_repos)
             
-            with shared_counters['print_lock']:
-                print(f"T{thread_id} total: {thread_repos} repos in {thread_fetch_time:.1f}s")
+            # with shared_counters['print_lock']:
+            #     print(f"T{thread_id} total: {thread_repos} repos in {thread_fetch_time:.1f}s")
         
         # Create thread pool and start crawling
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = []
             for i in range(num_threads):
                 futures.append(executor.submit(single_worker, i))
-                time.sleep(0.004)  # Sleep for 0.1 seconds between thread starts
+                time.sleep(0.0033)  # Sleep for 0.1 seconds between thread starts
             
             # Wait for all threads to complete
             for future in futures:
@@ -630,7 +638,7 @@ def main():
         total_repos = shared_counters['total_repos'].get()
         total_iterations = repeat_count * num_threads
         
-        print(f"\nFinal: {total_repos} repos in {total_wall_time:.1f}s ({(total_repos/total_wall_time):.1f} repos/sec)")
+        # print(f"\nFinal: {total_repos} repos in {total_wall_time:.1f}s ({(total_repos/total_wall_time):.1f} repos/sec)")
         
         # Calculate estimated time for 100k repos
         effective_rate = total_repos/total_wall_time
